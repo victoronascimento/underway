@@ -639,7 +639,7 @@ use std::{
 };
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
-use jiff::Span;
+use jiff::{Span, ToSpan};
 use sealed::JobState;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
@@ -734,7 +734,20 @@ pub struct Context<S> {
     pub queue_name: String,
 }
 
-type StepConfig<S> = (Box<dyn StepExecutor<S>>, RetryPolicy);
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepOverrides {
+    pub timeout: Span,
+}
+
+impl Default for StepOverrides {
+    fn default() -> Self {
+        Self {
+            timeout: 15.minutes(),
+        }
+    }
+}
+
+type StepConfig<S> = (Box<dyn StepExecutor<S>>, RetryPolicy, StepOverrides);
 
 mod sealed {
     use serde::{Deserialize, Serialize};
@@ -1645,7 +1658,7 @@ where
             return Err(TaskError::Fatal("Invalid step index.".into()));
         }
 
-        let (step, _) = &self.steps[step_index];
+        let (step, _, _) = &self.steps[step_index];
 
         // SAFETY:
         //
@@ -1666,6 +1679,7 @@ where
         // Note: This is a workaround due to limitations with trait objects and
         // lifetimes in async contexts. Be cautious with any changes that might
         // allow `step_tx` to outlive `tx`.
+
         let step_tx: Transaction<'static, Postgres> = unsafe { mem::transmute_copy(&tx) };
 
         let cx = Context {
@@ -1713,8 +1727,14 @@ where
 
     fn retry_policy(&self) -> RetryPolicy {
         let current_index = self.current_index.load(Ordering::SeqCst);
-        let (_, retry_policy) = self.steps[current_index];
+        let (_, retry_policy, _) = self.steps[current_index];
         retry_policy
+    }
+
+    fn timeout(&self) -> Span {
+        let current_index = self.current_index.load(Ordering::SeqCst);
+        let (_, _, overrides) = self.steps[current_index];
+        overrides.timeout
     }
 }
 
@@ -1904,7 +1924,7 @@ mod builder_states {
 /// Builder for constructing a `Job` with a sequence of steps.
 pub struct Builder<I, O, S, B> {
     builder_state: B,
-    steps: Vec<(Box<dyn StepExecutor<S>>, RetryPolicy)>,
+    steps: Vec<(Box<dyn StepExecutor<S>>, RetryPolicy, StepOverrides)>,
     _marker: PhantomData<(I, O, S)>,
 }
 
@@ -1995,7 +2015,56 @@ impl<I, S> Builder<I, I, S, Initial> {
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push((Box::new(step_fn), RetryPolicy::default()));
+        self.steps.push((
+            Box::new(step_fn),
+            RetryPolicy::default(),
+            StepOverrides::default(),
+        ));
+
+        Builder {
+            builder_state: StepSet {
+                state: (),
+                _marker: PhantomData,
+            },
+            steps: self.steps,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Add a step to the job.
+    ///
+    /// A step function should take the job context as its first argument
+    /// followed by some type that's `Serialize` and `Deserialize` as its
+    /// second argument.
+    ///
+    /// It should also return one of the [`To`] variants. For convenience, `To`
+    /// provides methods that return the correct types. Most commonly these
+    /// will be [`To::next`], when going on to another step, or [`To::done`],
+    /// when there are no more steps.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use underway::{Job, To};
+    ///
+    /// // Set a step.
+    /// let job_builder = Job::<(), ()>::builder().step(|_cx, _| async move { To::done() });
+    /// ```
+    pub fn step_with_overrides<F, O, Fut>(
+        mut self,
+        func: F,
+        overrides: StepOverrides,
+    ) -> Builder<I, O, S, StepSet<O, ()>>
+    where
+        I: DeserializeOwned + Serialize + Send + Sync + 'static,
+        O: Serialize + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
+    {
+        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
+        self.steps
+            .push((Box::new(step_fn), RetryPolicy::default(), overrides));
 
         Builder {
             builder_state: StepSet {
@@ -2050,7 +2119,68 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push((Box::new(step_fn), RetryPolicy::default()));
+        self.steps.push((
+            Box::new(step_fn),
+            RetryPolicy::default(),
+            StepOverrides::default(),
+        ));
+
+        Builder {
+            builder_state: StepSet {
+                state: self.builder_state.state,
+                _marker: PhantomData,
+            },
+            steps: self.steps,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Add a step to the job.
+    ///
+    /// A step function should take the job context as its first argument
+    /// followed by some type that's `Serialize` and `Deserialize` as its
+    /// second argument.
+    ///
+    /// It should also return one of the [`To`] variants. For convenience, `To`
+    /// provides methods that return the correct types. Most commonly these
+    /// will be [`To::next`], when going on to another step, or [`To::done`],
+    /// when there are no more steps.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use underway::{Job, To};
+    ///
+    /// #[derive(Clone)]
+    /// struct State {
+    ///     data: String,
+    /// }
+    ///
+    /// // Set a step with state.
+    /// let job_builder = Job::<(), _>::builder()
+    ///     .state(State {
+    ///         data: "foo".to_string(),
+    ///     })
+    ///     .step(|cx, _| async move {
+    ///         println!("State data: {}", cx.state.data);
+    ///         To::done()
+    ///     });
+    /// ```
+    pub fn step_with_overrides<F, O, Fut>(
+        mut self,
+        func: F,
+        overrides: StepOverrides,
+    ) -> Builder<I, O, S, StepSet<O, S>>
+    where
+        I: DeserializeOwned + Serialize + Send + Sync + 'static,
+        O: Serialize + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
+    {
+        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
+        self.steps
+            .push((Box::new(step_fn), RetryPolicy::default(), overrides));
 
         Builder {
             builder_state: StepSet {
@@ -2095,7 +2225,58 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
         Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push((Box::new(step_fn), RetryPolicy::default()));
+        self.steps.push((
+            Box::new(step_fn),
+            RetryPolicy::default(),
+            StepOverrides::default(),
+        ));
+
+        Builder {
+            builder_state: StepSet {
+                state: self.builder_state.state,
+                _marker: PhantomData,
+            },
+            steps: self.steps,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Add a subsequent step to the job.
+    ///
+    /// This method ensures that the input type of the new step matches the
+    /// output type of the previous step.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use serde::{Deserialize, Serialize};
+    /// use underway::{Job, To};
+    ///
+    /// #[derive(Deserialize, Serialize)]
+    /// struct Step2 {
+    ///     n: usize,
+    /// }
+    ///
+    /// // Set one step after another.
+    /// let job_builder = Job::<(), ()>::builder()
+    ///     .step(|_cx, _| async move { To::next(Step2 { n: 42 }) })
+    ///     .step(|_cx, Step2 { n }| async move { To::done() });
+    /// ```
+    pub fn step_with_overrides<F, New, Fut>(
+        mut self,
+        func: F,
+        overrides: StepOverrides,
+    ) -> Builder<I, New, S, StepSet<New, S>>
+    where
+        Current: DeserializeOwned + Serialize + Send + Sync + 'static,
+        New: Serialize + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+        F: Fn(Context<S>, Current) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
+    {
+        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
+        self.steps
+            .push((Box::new(step_fn), RetryPolicy::default(), overrides));
 
         Builder {
             builder_state: StepSet {
@@ -2128,7 +2309,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
         mut self,
         retry_policy: RetryPolicy,
     ) -> Builder<I, Current, S, StepSet<Current, S>> {
-        let (_, default_policy) = self.steps.last_mut().expect("Steps should not be empty");
+        let (_, default_policy, _) = self.steps.last_mut().expect("Steps should not be empty");
         *default_policy = retry_policy;
 
         Builder {
@@ -3158,6 +3339,54 @@ mod tests {
 
         // Should return `false` since the job is already cancelled.
         assert!(!enqueued_job.cancel().await?);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_job_with_timeout_override(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+        struct Input {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("one_step_enqueue")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step_with_overrides(
+                |_cx, Input { message }| async move {
+                    println!("Executing job with message: {message}");
+                    To::done()
+                },
+                StepOverrides {
+                    timeout: 5.minutes(),
+                },
+            )
+            .queue(queue.clone())
+            .build();
+
+        let input = Input {
+            message: "Hello, world!".to_string(),
+        };
+
+        let enqueued_job = job.enqueue(&input).await?;
+
+        let task = sqlx::query_scalar!(
+            r#"
+            select timeout
+            from underway.task
+            where input->>'job_id' = $1
+            "#,
+            enqueued_job.id.to_string()
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task.microseconds, 5 * 60 * 1000 * 1000);
 
         Ok(())
     }
